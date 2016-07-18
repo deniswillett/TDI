@@ -1,0 +1,629 @@
+---
+title: "Predicting Climate Effects on Core Commodity Prices"
+author: "Denis S. Willett"
+date: "July 17, 2016"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: sandstone
+    keep_md: true
+    code_folding: hide
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Summary
+
+Predicting prices of core agricultural commodities is paramount for producers, consumers, traders, and governments.  Here links between the core commodities corn, soy, and beef are explored in conjunction with climate variables using empirical dynamic modeling with state-space reconstruction of nonlinear dynamic systems.  These methods reveal that corn prices drive beef prices and that maximum daily temperature from Kossuth County, Iowa has an undue influence on national corn prices.  Additionally, prediction algorithms are derived from these insights that outperform traditional forecasting methods.  Inclusion of additional, more detailed, climate data will likely engender further insights and facilitate evaluating climate change effects on the prices of corn, soy, and beef.  These preliminary insights suggest a broader role for climate effects in forecasting commodity prices that will be useful to a variety of stakeholders.  
+
+# Motivation
+
+Corn, soy, and cattle are core agricultural commodities in the United States.  Corn and soy, used for human food, biofuel production, and animal feed are $67.3 and $38.7 billion industries respectively. Cattle production is a $76.4 billion industry.  Sales of these commodities together represent 46% of all US agricultural sales and prices of these commodities drive futures markets directly impacting the national and global economy.  
+
+The price of these commodities impacts producers, consumers, traders, and decision makers, but predicting these prices is complicated by the nonlinear, often chaotic nature of price fluctuations.  Here, nonlinear dynamics of corn, soy, and beef prices are analyzed using empirical dynamic modeling techniques to:
+
+* investigate influences of commodity prices on each other
+
+* investigate climatic factors influencing price fluctuations of these commodities
+
+* predict future prices of these commodities
+
+* evaluate impacts of climate change on the prices of these commodities
+
+# Strategy
+
+To investigate the influence of climatic factors, predict future prices, and evaluate impacts of climate change on the prices of corn, soy, and beef, we will rely on empirical dynamic modeling state-space reconstruction techniques originally designed to extract insights from complex ecological systems.  These techniques rely on the idea that parts of a system reflect the state of the system as a whole.  Past performance of a system has information on the potential states of a system which can be used to forecast future system states.  
+
+In contrast to traditional modeling and machine learning techniques which seek to relate explanatory variables to a dependent variable, these dynamic modeling techniques forego the traditional modeling approach in favor of determining causal relationships between and among data.  This approach can often outperform traditional modeling approaches for time series forecasting and relies upon a fundamental theorem which states that reconstructions of system states can be achieved through lagged time series embedding.  
+
+Our approach will be fourfold: 
+
+1.  Determine the optimum embedding dimension to reconstruct the commodity price system we are investigating.  
+
+2.  Determine the level of non-linearity in the system and distinguish our data from pure stochastic noise.
+
+3.  Determine strength of causal relationships between our variables.  
+
+4.  Develop a prediction scheme based on 1-3.  
+
+
+# Data
+
+Corn and soy commodity price data were downloaded using the Quandl API from the Top Flight Grain Cooperative database.  Choice beef price data were similarly downloaded from Quandl from the Wiki Commodity Prices database.  Climate data were accessed from NCEI (NOAA) for the county of Kossuth in the  state of Iowa, which is the county with the largest acreages of corn and soy in the state with the largest acreages of corn and soy in the US. 
+
+
+```{r, echo = FALSE, message = FALSE}
+# Load Libraries
+
+library(Quandl) # Quandl API
+library(Hmisc) # Imputation
+library(data.table) #rapid reading
+library(dplyr) # Data fun
+library(tidyr) # More fun
+library(lubridate) # Dates
+library(pryr) # R usage
+library(rEDM) # Empirical Dynamic Modeling
+library(ggplot2) # plotting
+library(FNN) # nearest neighbors
+library(plotly) # interactive plotting
+library(forecast) # ARIMAs
+library(Metrics) # RMSE
+```
+
+
+
+```{r Download Data, echo = FALSE,  message = FALSE}
+Quandl.api_key("nsjgsKLi3LbyyLaYivMp")
+
+corn <- Quandl("TFGRAIN/CORN")
+soy <- Quandl("TFGRAIN/SOYBEANS")
+
+choicebeef <- Quandl("COM/BEEF_C")
+
+weather <- fread('https://www.ncei.noaa.gov/orders/cdo/774619.csv',
+                 na.strings = '-9999')
+```
+
+```{r Join Data, message=FALSE}
+
+# Climate means for the state of Iowa for each date
+temps <- weather %>%
+    group_by(DATE) %>%
+    summarize(precip = mean(PRCP, na.rm = TRUE),
+              tmax = mean(TMAX, na.rm = TRUE),
+              tmin = mean(TMIN, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(Date = ymd(DATE)) %>%
+    select(-DATE)
+    
+# Combine commodity data sets with weather dataset
+comdata <- corn %>% mutate(CornPrice = `Cash Price`) %>% 
+    select(Date, CornPrice) %>% left_join(soy) %>% 
+    mutate(SoyPrice = `Cash Price`) %>%
+    select(Date, CornPrice, SoyPrice) %>% left_join(choicebeef) %>%
+    filter(Date >= min(choicebeef$Date)) %>%
+    left_join(temps) %>%
+    mutate(BeefPrice = Value) %>% select(-Value) %>% arrange(Date)
+```
+
+
+# Analysis
+
+## Simplex Projection
+
+We will use simplex projection to determine the optimum embedding dimension needed to reconstruct our system and best predict future commodity prices.  Time series embedding is used to recreate system states.  From the embedded time series, nearest neighbors to a given time point are selected and projected one time step forward to predict the next time point.  The strength of that prediction (determined by pearsons correlation coefficient) is used to determine the optimum embedding dimension.  
+
+```{r}
+# Variables to project
+varlst <- colnames(comdata)[-1]
+
+# Place to put output
+simplex_output <- data.frame(NULL)
+
+# Library of system
+lib <- c(1800, 2000)
+
+# Part of Time Series to predict
+pred <- c(2001, 2300)
+
+# Simplex projection with embedding dimensions 1 to 12
+for (i in 1:length(varlst)) {
+    out <- simplex(select_(comdata, 'Date', varlst[i]), 
+        lib = lib, pred = pred, E = c(1:12))
+    out <- out %>% mutate(Var = varlst[i])
+    simplex_output <- rbind(simplex_output, out)
+}
+
+# Find optimum embedding dimension
+embeddim <- simplex_output %>%
+    group_by(Var) %>%
+    arrange(desc(rho)) %>%
+    summarize(E = first(E))
+
+# Plot
+so <- ggplot(simplex_output, aes(x = E, y = rho)) + 
+    geom_line() + 
+    theme_bw(14) + 
+    facet_wrap( ~ Var, scales = 'free') + 
+    labs(x = 'Embedding Dimension', y = 'Forecast Strength') + 
+    scale_x_continuous(breaks = seq(2, 12, by = 2))
+
+ggplotly(so)
+
+```
+
+The optimum embedding dimension is that which has the highest forecast strength - the apex of the curve.  
+
+
+## Non-linearity Testing
+
+To test for non-linearity, we will vary the complexity of the projection.  Instead of using simplex projection which is based on nearest neighbor forecasting of embedded time series, we will apply s-map which uses local maps to estimate predictions.  By tuning these maps, we can add nonlinear complexity to our projections.  
+
+
+```{r}
+# Create holder for data
+smap_out <- data.frame(NULL)
+
+# S-map projections varying theta from 0 to 14
+for (i in 1:length(varlst)) {
+    out <- s_map(select_(comdata, 'Date', varlst[i]), 
+                 lib = lib, pred = pred, 
+                 E = filter(embeddim, Var == varlst[i])$E, 
+                 theta = 0:6,
+                 silent = TRUE)
+    out <- out %>% mutate(Var = varlst[i])
+    smap_out <- rbind(smap_out, out)
+}
+
+# Find Thetas
+theta <- smap_out %>%
+    group_by(Var) %>%
+    arrange(desc(rho)) %>%
+    summarize(theta = first(theta))
+
+# Plot
+to <- ggplot(smap_out, aes(x = theta, y = rho)) + 
+    geom_line() + 
+    theme_bw(14) + 
+    facet_wrap( ~ Var, scales = 'free') + 
+    labs(x = 'Degree of Nonlinearity (Theta)', y = 'Forecast Strength') + 
+    scale_x_continuous(breaks = seq(0, 14, by = 2))
+
+ggplotly(to)
+
+```
+
+There appears to be a degree of nonlinearity.  A theta of 0 is identical to an autoregressive model.  Many of our variables have their optimum forecast at greater than 0 thetas indicating that our state-space reconstruction approach to this nonlinear system may pay off.  
+
+## Causal Relationships {.tabset}
+
+To determine causal relationships between the variables in our dataset, we will use convergent cross mapping.  This technique measures the degree of forcing one variable exerts on the other by examining the ability of embedded (reconstructed) timeseries of one variable to map to or predict another embedded timesseries of another variable.  
+
+This ability to map to another embedded variable can be measured by examining forecasting power over increasing sizes of respective time series.  If one timeseries is causally linked to and forces another, its forecasting strength (as measured by Pearson's correlation coefficient) will increase.  This can be seen in the Commodity Forcing tab below.  Both Corn and Soy prices exert some influence on beef prices - the forecasting strength of their embedded timeseries increases with increasing library size.  The degree of influence can be determined by where that forecasting strength plateaus; corn exerts a much stronger influence than soy.  
+
+Interestingly, a similar pattern is seen with corn and temperature on the Climate Forcing tab.  Temperature exerts an influence on corn and soy prices.  While this may seem intuitive, it is important to note that these are national commodity prices and that temperature is the maximum daily temperature as averaged from three weather stations in Kossuth County, Iowa.  Interpreted more specifically, the maximum daily temperature in Kossuth County, Iowa exerts undue influence on national corn and soy prices.  This influence could point to a potentially larger role of climatic variables for influencing commodity prices that can be used in projections under climate change scenarios.  
+
+```{r Causal, cache = TRUE}
+
+# Convergent Cross Mapping bidirectionally for all variables of interest
+# E (embedding dimensions) are taken from simplex projection up above
+corn_xmap_beef <- ccm(comdata, E = 2,
+                      lib_column = 'CornPrice', 
+                      target_column = 'BeefPrice', 
+                      lib_sizes = seq(10, 200, by = 10), 
+                      random_libs = TRUE,
+                      silent = TRUE)
+
+
+beef_xmap_corn <- ccm(comdata, E = 1,
+                      lib_column = 'BeefPrice', 
+                      target_column = 'CornPrice', 
+                      lib_sizes = seq(10, 200, by = 10), 
+                      random_libs = TRUE,
+                      silent = TRUE)
+
+c_x_b <- ccm_means(corn_xmap_beef)
+b_x_c <- ccm_means(beef_xmap_corn)
+
+c_x_b$Label <- 'Beef Forces Corn'
+b_x_c$Label <- 'Corn Forces Beef'
+
+cb_ccm <- rbind(c_x_b, b_x_c)
+
+soy_xmap_beef <- ccm(comdata, E = 2, 
+                      lib_column = 'SoyPrice', 
+                      target_column = 'BeefPrice', 
+                      lib_sizes = seq(10, 200, by = 10), 
+                      random_libs = TRUE,
+                     silent = TRUE)
+
+
+beef_xmap_soy <- ccm(comdata, E = 2, 
+                      lib_column = 'BeefPrice', 
+                      target_column = 'SoyPrice', 
+                      lib_sizes = seq(10, 200, by = 10), 
+                      random_libs = TRUE,
+                     silent = TRUE)
+
+s_x_b <- ccm_means(soy_xmap_beef)
+b_x_s <- ccm_means(beef_xmap_soy)
+
+s_x_b$Label <- 'Beef Forces Soy'
+b_x_s$Label <- 'Soy Forces Beef'
+
+sb_ccm <- rbind(s_x_b, b_x_s)
+
+com_ccm <- rbind(cb_ccm, sb_ccm)
+```
+
+```{r Climate Forcing}
+# As above for climate
+
+soy_xmap_precip <- ccm(comdata, E = 4, 
+                     lib_column = 'SoyPrice', 
+                     target_column = 'precip', 
+                     lib_sizes = seq(10, 200, by = 10), 
+                     random_libs = TRUE, 
+                     silent = TRUE)
+
+corn_xmap_precip <- ccm(comdata, E = 4, 
+                     lib_column = 'CornPrice', 
+                     target_column = 'precip', 
+                     lib_sizes = seq(10, 200, by = 10), 
+                     random_libs = TRUE,
+                     silent = TRUE)
+
+soy_xmap_tmax <- ccm(comdata, E = 8, 
+                     lib_column = 'SoyPrice', 
+                     target_column = 'tmax', 
+                     lib_sizes = seq(10, 200, by = 10), 
+                     random_libs = TRUE, 
+                     silent = TRUE)
+
+corn_xmap_tmax <- ccm(comdata, E = 8, 
+                     lib_column = 'CornPrice', 
+                     target_column = 'tmax', 
+                     lib_sizes = seq(10, 200, by = 10), 
+                     random_libs = TRUE,
+                     silent = TRUE)
+
+
+s_x_p <- ccm_means(soy_xmap_precip)
+c_x_p <- ccm_means(corn_xmap_precip)
+s_x_t <- ccm_means(soy_xmap_tmax)
+c_x_t <- ccm_means(corn_xmap_tmax)
+
+s_x_p$Label <- 'Precip Forces Soy'
+c_x_p$Label <- 'Precip Forces Corn'
+s_x_t$Label <- 'Temp Forces Soy'
+c_x_t$Label <- 'Temp Forces Corn'
+
+clim_ccm <- rbind(s_x_p, c_x_p, s_x_t, c_x_t)
+```
+
+
+
+
+
+### Commodity Forcing 
+
+```{r comForces, echo=FALSE}
+inputPanel(
+    checkboxGroupInput('vars', label = 'Commodity Forcing', 
+                       choices = c('Corn Forces Beef', 
+                                   'Beef Forces Corn', 
+                                   'Soy Forces Beef', 
+                                   'Beef Forces Soy'),
+                       selected = c('Corn Forces Beef', 'Soy Forces Beef')))
+              
+
+renderPlotly({
+    como <- ggplot(filter(com_ccm, Label %in% input$vars), 
+                   aes(x = lib_size, y = rho, linetype = Label)) +  
+        geom_line() + 
+        theme_bw(14) + 
+        labs(x = 'Library Size', y = 'Forecast Strength') + 
+        scale_linetype_manual(values = c('twodash', 'longdash', 'dotted', 'solid'))
+    
+    ggplotly(como)
+    
+})
+```
+
+### Climate Forcing
+
+
+```{r climForces, echo=FALSE}
+inputPanel(
+    checkboxGroupInput('climvars', label = 'Climate Forcing', 
+                       choices = c('Precip Forces Corn', 
+                                   'Precip Forces Soy', 
+                                   'Temp Forces Corn', 
+                                   'Temp Forces Soy'),
+                       selected = c('Precip Forces Corn', 
+                                   'Precip Forces Soy', 
+                                   'Temp Forces Corn', 
+                                   'Temp Forces Soy')))
+              
+
+renderPlotly({
+    climcom <- ggplot(filter(clim_ccm, Label %in% input$climvars), 
+                   aes(x = lib_size, y = rho, linetype = Label)) +  
+        geom_line() + 
+        theme_bw(14) + 
+        labs(x = 'Library Size', y = 'Forecast Strength') + 
+        scale_linetype_manual(values = c('twodash', 'longdash', 'dotted', 'solid'))
+    
+    ggplotly(climcom)
+    
+})
+```
+
+
+# Predictions {.tabset}
+
+```{r beefpred, cache = TRUE}
+preddata <- data.frame(Date = comdata$Date,
+                       CP = comdata$CornPrice,
+                       CP_1 = c(NA, comdata$CornPrice[1:(nrow(comdata) - 1)]),
+                       CP_2 = c(NA, NA, comdata$CornPrice[1:(nrow(comdata) - 2)]),
+                       CP_3 = c(NA, NA, NA, comdata$CornPrice[1:(nrow(comdata) - 3)]),
+                       CP_4 = c(NA, NA, NA, NA, comdata$CornPrice[1:(nrow(comdata) - 4)]),
+                       SP = comdata$SoyPrice,
+                       SP_1 = c(NA, comdata$SoyPrice[1:(nrow(comdata) - 1)]),
+                       SP_2 = c(NA, NA, comdata$SoyPrice[1:(nrow(comdata) - 2)]),
+                       BP = comdata$BeefPrice,
+                       BP_1 = c(NA, comdata$BeefPrice[1:(nrow(comdata) - 1)]),
+                       BP_2 = c(NA, NA, comdata$BeefPrice[1:(nrow(comdata) - 2)]),
+                       P = comdata$precip,
+                       P_1 = c(NA, comdata$precip[1:(nrow(comdata) - 1)]),
+                       P_2 = c(NA, NA, comdata$precip[1:(nrow(comdata) - 2)]))
+
+preddata <- preddata %>% arrange(Date)
+
+bf <- block_lnlp(preddata, lib = c(2000, 2200), pred = c(2201, 2300),
+                 columns = c('BP'), 
+                 target_column = 'BP', stats_only = FALSE, 
+                 first_column_time = TRUE, method = 's-map')
+
+beefpreds <- data.frame(NULL)
+topred <- 2201:2300
+for (i in 1:length(topred)) {
+        aab <- auto.arima(preddata$BP[c(2000:2200, topred[i])])
+        fc <- as.numeric(forecast(aab, h = 1)$mean)
+        beefpreds <- rbind(beefpreds, 
+                           data.frame(Date = preddata$Date[i], APred = fc))
+}
+
+
+b.observed <- bf[[1]]$model_output$obs
+b.predicted <- bf[[1]]$model_output$pred
+
+bpred <- data.frame(Date = preddata$Date[2201:2300],
+                    obs = b.observed[2201:2300],
+                    S_Map = b.predicted[2201:2300],
+                    ARIMA = beefpreds$APred) %>% na.omit() %>%
+    gather(Type, Value, -Date)
+
+statpred <- data.frame(Date = preddata$Date[2201:2300],
+                    obs = b.observed[2201:2300],
+                    S_Map = b.predicted[2201:2300],
+                    ARIMA = beefpreds$APred) %>% na.omit()
+
+lnlp <- rmse(statpred$obs, statpred$S_Map)
+arms <- rmse(statpred$obs, statpred$ARIMA)
+
+```
+
+
+```{r cornpred, cache = TRUE}
+preddata <- data.frame(Date = comdata$Date,
+                       CP = comdata$CornPrice,
+                       CP_1 = c(NA, comdata$CornPrice[1:(nrow(comdata) - 1)]),
+                       CP_2 = c(NA, NA, comdata$CornPrice[1:(nrow(comdata) - 2)]),
+                       CP_3 = c(NA, NA, NA, comdata$CornPrice[1:(nrow(comdata) - 3)]),
+                       CP_4 = c(NA, NA, NA, NA, comdata$CornPrice[1:(nrow(comdata) - 4)]),
+                       SP = comdata$SoyPrice,
+                       SP_1 = c(NA, comdata$SoyPrice[1:(nrow(comdata) - 1)]),
+                       SP_2 = c(NA, NA, comdata$SoyPrice[1:(nrow(comdata) - 2)]),
+                       BP = comdata$BeefPrice,
+                       BP_1 = c(NA, comdata$BeefPrice[1:(nrow(comdata) - 1)]),
+                       BP_2 = c(NA, NA, comdata$BeefPrice[1:(nrow(comdata) - 2)]),
+                       P = comdata$precip,
+                       P_1 = c(NA, comdata$precip[1:(nrow(comdata) - 1)]),
+                       P_2 = c(NA, NA, comdata$precip[1:(nrow(comdata) - 2)]))
+
+preddata <- preddata %>% arrange(Date)
+
+cp <- block_lnlp(preddata, lib = c(2000, 2200), pred = c(2201, 2300),
+                 columns = c('CP'), 
+                 target_column = 'CP', stats_only = FALSE, 
+                 first_column_time = TRUE, method = 's-map')
+
+cornpreds <- data.frame(NULL)
+topred <- 2201:2300
+for (i in 1:length(topred)) {
+        aab <- auto.arima(preddata$CP[c(2000:2200, topred[i])])
+        fc <- as.numeric(forecast(aab, h = 1)$mean)
+        cornpreds <- rbind(cornpreds, 
+                           data.frame(Date = preddata$Date[i], APred = fc))
+}
+
+
+c.observed <- cp[[1]]$model_output$obs
+c.predicted <- cp[[1]]$model_output$pred
+
+cpred <- data.frame(Date = preddata$Date[2201:2300],
+                    obs = c.observed[2201:2300],
+                    S_Map = c.predicted[2201:2300],
+                    ARIMA = cornpreds$APred) %>% na.omit() %>%
+    gather(Type, Value, -Date)
+
+cstatpred <- data.frame(Date = preddata$Date[2201:2300],
+                    obs = c.observed[2201:2300],
+                    S_Map = c.predicted[2201:2300],
+                    ARIMA = cornpreds$APred) %>% na.omit()
+
+clnlp <- rmse(cstatpred$obs, cstatpred$S_Map)
+carms <- rmse(cstatpred$obs, cstatpred$ARIMA)
+
+```
+
+
+```{r soypred, cache = TRUE}
+preddata <- data.frame(Date = comdata$Date,
+                       CP = comdata$CornPrice,
+                       CP_1 = c(NA, comdata$CornPrice[1:(nrow(comdata) - 1)]),
+                       CP_2 = c(NA, NA, comdata$CornPrice[1:(nrow(comdata) - 2)]),
+                       CP_3 = c(NA, NA, NA, comdata$CornPrice[1:(nrow(comdata) - 3)]),
+                       CP_4 = c(NA, NA, NA, NA, comdata$CornPrice[1:(nrow(comdata) - 4)]),
+                       SP = comdata$SoyPrice,
+                       SP_1 = c(NA, comdata$SoyPrice[1:(nrow(comdata) - 1)]),
+                       SP_2 = c(NA, NA, comdata$SoyPrice[1:(nrow(comdata) - 2)]),
+                       BP = comdata$BeefPrice,
+                       BP_1 = c(NA, comdata$BeefPrice[1:(nrow(comdata) - 1)]),
+                       BP_2 = c(NA, NA, comdata$BeefPrice[1:(nrow(comdata) - 2)]),
+                       P = comdata$precip,
+                       P_1 = c(NA, comdata$precip[1:(nrow(comdata) - 1)]),
+                       P_2 = c(NA, NA, comdata$precip[1:(nrow(comdata) - 2)]))
+
+preddata <- preddata %>% arrange(Date)
+
+sp <- block_lnlp(preddata, lib = c(2000, 2200), pred = c(2201, 2300),
+                 columns = c('SP'), 
+                 target_column = 'SP', stats_only = FALSE, 
+                 first_column_time = TRUE, method = 's-map')
+
+soypreds <- data.frame(NULL)
+topred <- 2201:2300
+for (i in 1:length(topred)) {
+        aab <- auto.arima(preddata$SP[c(2000:2200, topred[i])])
+        fc <- as.numeric(forecast(aab, h = 1)$mean)
+        soypreds <- rbind(soypreds, 
+                           data.frame(Date = preddata$Date[i], APred = fc))
+}
+
+
+s.observed <- sp[[1]]$model_output$obs
+s.predicted <- sp[[1]]$model_output$pred
+
+spred <- data.frame(Date = preddata$Date[2201:2300],
+                    obs = s.observed[2201:2300],
+                    S_Map = s.predicted[2201:2300],
+                    ARIMA = soypreds$APred) %>% na.omit() %>%
+    gather(Type, Value, -Date)
+
+sstatpred <- data.frame(Date = preddata$Date[2201:2300],
+                    obs = s.observed[2201:2300],
+                    S_Map = s.predicted[2201:2300],
+                    ARIMA = soypreds$APred) %>% na.omit()
+
+slnlp <- rmse(sstatpred$obs, sstatpred$S_Map)
+sarms <- rmse(sstatpred$obs, sstatpred$ARIMA)
+
+```
+
+
+## Beef Prices
+
+```{r beefpredplot, echo=FALSE}
+inputPanel(
+    checkboxGroupInput('beefpred', label = 'Beef Price Predictions', 
+                       choices = c('ARIMA', 
+                                   'S_Map'),
+                       selected = c('ARIMA', 
+                                   'S_Map')))
+              
+
+renderPlotly({
+    bpplot <- ggplot() +  
+        geom_line(data = preddata[2000:2300,], aes(x = Date, y = BP)) + 
+        geom_line(data = filter(bpred, Type %in% input$beefpred),
+                  aes(x = Date, y = Value, color = Type)) + 
+        labs(x = 'Date', y = 'Beef Price ($)') + 
+        theme_bw(14)
+    
+    ggplotly(bpplot)
+    
+})
+```
+
+RMSE of s-map projection is 2.22.  RMSE of ARIMA is 3.04. 
+
+## Soy Prices
+
+```{r soypredplot, echo=FALSE}
+inputPanel(
+    checkboxGroupInput('soypred', label = 'Soy Price Predictions', 
+                       choices = c('ARIMA', 
+                                   'S_Map'),
+                       selected = c('ARIMA', 
+                                   'S_Map')))
+              
+
+renderPlotly({
+    spplot <- ggplot() +  
+        geom_line(data = preddata[2000:2300,], aes(x = Date, y = SP)) + 
+        geom_line(data = filter(spred, Type %in% input$soypred),
+                  aes(x = Date, y = Value, color = Type)) + 
+        labs(x = 'Date', y = 'Soy Price ($)') + 
+        theme_bw(14)
+    
+    ggplotly(spplot)
+    
+})
+```
+
+RMSE of s-map projection is 0.70.  RMSE of ARIMA is 0.14. 
+
+## Corn Prices
+
+```{r cornpredplot, echo=FALSE}
+inputPanel(
+    checkboxGroupInput('cornpred', label = 'Corn Price Predictions', 
+                       choices = c('ARIMA', 
+                                   'S_Map'),
+                       selected = c('ARIMA', 
+                                   'S_Map')))
+              
+
+renderPlotly({
+    cpplot <- ggplot() +  
+        geom_line(data = preddata[2000:2300,], aes(x = Date, y = CP)) + 
+        geom_line(data = filter(cpred, Type %in% input$cornpred),
+                  aes(x = Date, y = Value, color = Type)) + 
+        labs(x = 'Date', y = 'Corn Price ($)') + 
+        theme_bw(14)
+    
+    ggplotly(cpplot)
+    
+})
+```
+
+RMSE of s-map projection is 0.063.  RMSE of ARIMA is 0.059. 
+
+# Take Aways
+
+Using these empirical dynamic modeling techniques to delve into the nonlinear dynamics of commodity prices has provided a few insights:
+
+* Corn and soy prices influence beef prices.  
+
+* Additionally, corn prices exert more influence than soy prices on the price of beef.  These relationships could become more important as demands are placed upon corn production for biofuel production.  
+
+
+* Temperature influences corn prices.  While this makes intuitive sense, it is important to point out that specifically the maximum daily temperature as measured by three weather stations in Kossuth County, Iowa influences corn prices.  Given that this type of analysis was able to detect such a link suggests the importance of climate in influencing commodity prices, particularly in light of our changing climate.  
+
+* Prediction using these techniques outperforms traditional analysis.  These types of predictions could benefit producers, consumers, and traders.  
+
+# Next Steps
+
+This project will benefit from more elaborate climate data (i.e. not just temperature and precipitation data from one county in Iowa).  More detailed data will likely strengthen the link between climate and commodity prices and provide a basis for predicting future commodity prices based on climate changes.  Historical climate datasets are available from NCEI (NOAA) for the entire corn and soy growing region of the United States and can be examined for stronger indicators of commodity prices.  Additionally the NCEI and other agencies make available a large quantity of climate change projections that can be incorporated into this analysis to provide insights into the future of commodity prices under a changing climate.  
+
+# References
+
+For more information on these methods, please look into [Dr. Sugihara](http://scrippsscholars.ucsd.edu/gsugihara/biocv) whose insights have allowed these methods to flourish.  
+
